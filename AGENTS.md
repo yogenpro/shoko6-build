@@ -118,6 +118,8 @@ self-describing months later — check it before installing.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
+| `401 Bad credentials` on the first step | `GITHUB_TOKEN` is not exposed as an env var to `run:` steps; it must be mapped from the `github` context | The step sets `env: GH_TOKEN: ${{ github.token }}`. If you add a step that calls the GitHub API, do the same |
+| `Upstream ref '<x>' not found` | Typo, or the tag does not exist yet | Verify with `gh api repos/ShokoAnime/ShokoServer/tags --jq '.[].name'` |
 | `error NETSDK1045` / "current .NET SDK does not support net10.0" | `DOTNET_VERSION` too low | Bump to `10.0.x`; SDK must match the target framework |
 | `webui/index.html missing after injection` | `WEBUI_VERSION` tag does not exist | Verify the URL returns 302/200 (step 3), fix the pin |
 | `webui looks truncated: only N files` | Zip downloaded but truncated | Re-run; check `WEBUI_VERSION` pin |

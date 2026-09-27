@@ -54,17 +54,36 @@ jobs:
       - name: Resolve versions
         id: ver
         shell: pwsh
+        # GITHUB_TOKEN is NOT exposed as an environment variable to run
+        # steps automatically; it must be mapped from the github context.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $ref = '${{ inputs.shoko_ref }}'
           if ([string]::IsNullOrWhiteSpace($ref)) { $ref = $env:SHOKO_REF }
           $webui = '${{ inputs.webui_version }}'
           if ([string]::IsNullOrWhiteSpace($webui)) { $webui = $env:WEBUI_VERSION }
 
+          if ([string]::IsNullOrWhiteSpace($ref))    { throw 'SHOKO_REF resolved to empty' }
+          if ([string]::IsNullOrWhiteSpace($webui))  { throw 'WEBUI_VERSION resolved to empty' }
+
           # Record the exact upstream commit so the artifact is traceable
           # even if the tag is later moved. Use the REST API directly so we
           # do not depend on the gh CLI being present on the runner.
-          $sha = (Invoke-RestMethod -Uri "https://api.github.com/repos/ShokoAnime/ShokoServer/commits/$ref" `
-                    -Headers @{ 'User-Agent' = 'shoko6-build'; 'Authorization' = "Bearer $env:GITHUB_TOKEN" }).sha
+          $headers = @{
+            'User-Agent'    = 'shoko6-build'
+            'Authorization' = "Bearer $env:GH_TOKEN"
+            'Accept'        = 'application/vnd.github+json'
+          }
+          $api = "https://api.github.com/repos/ShokoAnime/ShokoServer/commits/$ref"
+          try {
+            $sha = (Invoke-RestMethod -Uri $api -Headers $headers).sha
+          } catch {
+            $code = $_.Exception.Response.StatusCode.value__
+            if ($code -eq 404) { throw "Upstream ref '$ref' not found in ShokoAnime/ShokoServer. Check the tag name: `n  gh api repos/ShokoAnime/ShokoServer/tags --jq '.[].name' | grep '^v6\.0\.0-dev' | head" }
+            throw "GitHub API call failed (HTTP $code) resolving '$ref': $($_.ErrorDetails.Message)"
+          }
           "SHOKO_REF_RESOLVED=$ref"                >> $env:GITHUB_OUTPUT
           "SHOKO_SHA=$sha"                         >> $env:GITHUB_OUTPUT
           "WEBUI_RESOLVED=$webui"                  >> $env:GITHUB_OUTPUT
