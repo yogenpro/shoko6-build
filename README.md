@@ -99,3 +99,8 @@ This is an unofficial convenience build. It contains no Shoko source; the
 workflow fetches upstream at a pinned ref. See
 [ShokoAnime/ShokoServer](https://github.com/ShokoAnime/ShokoServer) for the
 project itself and its GPL-3.0 license.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Covers this repository only; the Shoko Server
+source it builds is GPL-3.0 and licensed separately by its authors.
