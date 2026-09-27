@@ -1,0 +1,210 @@
+name: Build Shoko 6 (win-x64)
+
+# Build a self-contained win-x64 Shoko Server 6.x CLI from upstream source.
+#
+# Upstream ships NO Windows artifact for 6.x: the daily build matrix for
+# Shoko.CLI is ['linux-x64', 'linux-arm64', 'osx-arm64'] only. The only
+# win-x64 artifacts are Shoko.TrayService, which is a tray application and
+# the wrong shape for a headless NSSM service. So we build it ourselves.
+#
+# This repo is deliberately NOT a fork. It holds only this workflow, and
+# checks out ShokoAnime/ShokoServer at a pinned ref. Upgrading = edit
+# SHOKO_REF below. See AGENTS.md for the full procedure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shoko_ref:
+        description: 'ShokoServer git ref to build (blank = use pinned SHOKO_REF)'
+        required: false
+        default: ''
+        type: string
+      webui_version:
+        description: 'Shoko-WebUI version (blank = use pinned WEBUI_VERSION)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # ---- PINS: the only two things to edit when upgrading ----
+  # Shoko Server 6.x dev tag. Verified: v6.0.0-dev.487 = 8f8507b9b6
+  SHOKO_REF: v6.0.0-dev.487
+  # Shoko-WebUI. Must be the 2.6.0-dev.* line that matches the server.
+  # Verified: 2.6.0-dev.145
+  WEBUI_VERSION: 2.6.0-dev.145
+  # ---- END PINS ----
+  DOTNET_VERSION: '10.0.x'
+  RID: win-x64
+
+jobs:
+  build:
+    name: Shoko CLI (Standalone ${{ matrix.rid }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64]
+
+    steps:
+      - name: Resolve versions
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = '${{ inputs.shoko_ref }}'
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = $env:SHOKO_REF }
+          $webui = '${{ inputs.webui_version }}'
+          if ([string]::IsNullOrWhiteSpace($webui)) { $webui = $env:WEBUI_VERSION }
+
+          # Record the exact upstream commit so the artifact is traceable
+          # even if the tag is later moved. Use the REST API directly so we
+          # do not depend on the gh CLI being present on the runner.
+          $sha = (Invoke-RestMethod -Uri "https://api.github.com/repos/ShokoAnime/ShokoServer/commits/$ref" `
+                    -Headers @{ 'User-Agent' = 'shoko6-build'; 'Authorization' = "Bearer $env:GITHUB_TOKEN" }).sha
+          "SHOKO_REF_RESOLVED=$ref"                >> $env:GITHUB_OUTPUT
+          "SHOKO_SHA=$sha"                         >> $env:GITHUB_OUTPUT
+          "WEBUI_RESOLVED=$webui"                  >> $env:GITHUB_OUTPUT
+          "SHOKO_REF=$ref"                         >> $env:GITHUB_ENV
+          "WEBUI=$webui"                           >> $env:GITHUB_ENV
+          "WEBUI_URL=https://github.com/ShokoAnime/Shoko-WebUI/releases/download/v$webui/Shoko-WebUI-v$webui.zip" >> $env:GITHUB_ENV
+
+          "pinned_ref   = $env:SHOKO_REF"
+          "resolved_sha = $sha"
+          "webui        = $webui"
+
+      - name: Checkout upstream ShokoServer at pinned ref
+        uses: actions/checkout@v4
+        with:
+          # Not our fork: we build upstream at a pinned ref. See AGENTS.md
+          # for why this repo is not a fork.
+          repository: ShokoAnime/ShokoServer
+          ref: ${{ steps.ver.outputs.SHOKO_REF_RESOLVED }}
+          path: src
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # No ReplaceTmdbApiKey.ps1 / ReplaceSentryDSN.ps1 steps here, unlike
+      # upstream's build-release.yml. Those substitute a maintainer-supplied
+      # shared key into Constants.cs for the community binary. Both are
+      # OPTIONAL for a private build:
+      #   - TMDB: Shoko falls back to AniDB ordering with no key, which is
+      #     the default for a fresh install. Supplying a key changes episode
+      #     numbering, so add one only deliberately.
+      #   - Sentry: no DSN means no crash reporting. Set SentryOptOut in the
+      #     server settings if you prefer to be explicit about it.
+      # See AGENTS.md if you later want your own TMDB key.
+
+      - name: Download Shoko-WebUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path webui-dl | Out-Null
+          $zip = 'webui-dl\webui.zip'
+          Invoke-WebRequest -Uri $env:WEBUI_URL -OutFile $zip
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 2)
+          "downloaded $env:WEBUI ($size MB)"
+
+      - name: Inject WebUI into Shoko.Server\webui
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The zip is FLAT (index.html at the archive root, assets/ beside
+          # it), so extract straight into the csproj's expected location.
+          # Shoko.Server.csproj does:
+          #   <Content Include="webui\**\*" CopyToOutputDirectory="PreserveNewest" />
+          $dest = 'src\Shoko.Server\webui'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path 'webui-dl\webui.zip' -DestinationPath $dest -Force
+          Get-ChildItem -Recurse -File $dest | ForEach-Object { "  injected: $($_.FullName.Substring($dest.Length+1))" }
+
+      - name: Verify WebUI was actually injected
+        shell: pwsh
+        run: |
+          # The upstream repo ships a placeholder Shoko.Server/webui/index.html,
+          # so a build SUCCEEDS even if the WebUI download failed silently.
+          # Assert the real payload landed instead of trusting exit codes.
+          $ErrorActionPreference = 'Stop'
+          $dest = 'src\Shoko.Server\webui'
+          $index = Join-Path $dest 'index.html'
+          if (-not (Test-Path $index)) { throw "webui/index.html missing after injection" }
+          $count = @(Get-ChildItem -Recurse -File $dest).Count
+          $assets = @(Get-ChildItem -Recurse -File (Join-Path $dest 'assets') -EA SilentlyContinue).Count
+          "webui files = $count (assets: $assets)"
+          if ($count -lt 20) { throw "webui looks truncated: only $count files (expected ~28)" }
+          $v = Join-Path $dest 'version.json'
+          if (Test-Path $v) { "webui version.json: $((Get-Content $v -Raw).Trim())" }
+
+      - name: dotnet publish (self-contained ${{ matrix.rid }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location src
+          # Mirrors upstream's own Dockerfile:
+          #   dotnet build -c=Release -r linux-x64 -f net10.0 Shoko.CLI/Shoko.CLI.csproj
+          # plus --self-contained so the target host needs no .NET runtime
+          # installed. This matches how Shoko 5.x ships its Windows binaries.
+          dotnet publish -c Release -r ${{ matrix.rid }} -f net10.0 `
+            --self-contained true `
+            Shoko.CLI `
+            /p:Version="6.0.0-dev+local" `
+            /p:InformationalVersion="$env:SHOKO_SHA"
+          Pop-Location
+
+      - name: Verify publish output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "src\Shoko.Server\bin\Release\net10.0\${{ matrix.rid }}\publish"
+          if (-not (Test-Path $out)) { throw "publish output missing: $out" }
+          $exe = Join-Path $out 'Shoko.CLI.exe'
+          if (-not (Test-Path $exe)) { throw "Shoko.CLI.exe missing from publish output" }
+          # The WebUI must be in the publish output too, not just the source tree.
+          $webuiOut = Join-Path $out 'webui'
+          $webuiCount = if (Test-Path $webuiOut) { @(Get-ChildItem -Recurse -File $webuiOut).Count } else { 0 }
+          "publish webui files = $webuiCount"
+          if ($webuiCount -lt 20) { throw "webui did not reach publish output (only $webuiCount files)" }
+          $files = @(Get-ChildItem -Recurse -File $out)
+          $bytes = ($files | Measure-Object Length -Sum).Sum
+          "publish files = $($files.Count)"
+          "publish size  = $([math]::Round($bytes/1MB,1)) MB"
+          "SHOKO_SHA=$env:SHOKO_SHA" >> $env:GITHUB_ENV
+          "SHOKO_REF_OUT=$env:SHOKO_REF" >> $env:GITHUB_ENV
+          "WEBUI_OUT=$env:WEBUI" >> $env:GITHUB_ENV
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "src\Shoko.Server\bin\Release\net10.0\${{ matrix.rid }}\publish"
+          $stage = "dist\Shoko.CLI_Standalone_${{ matrix.rid }}_$env:SHOKO_REF"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $out '*') $stage
+          # Record provenance INSIDE the artifact so a downloaded zip is
+          # self-describing months later.
+          @{
+            shoko_ref  = $env:SHOKO_REF
+            shoko_sha  = $env:SHOKO_SHA
+            webui      = $env:WEBUI
+            rid        = '${{ matrix.rid }}'
+            self_contained = $true
+            tmdb_key   = 'none (AniDB ordering)'
+            built_utc  = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $stage 'BUILD-PROVENANCE.json')
+          $files = @(Get-ChildItem -Recurse -File $stage)
+          "staged $($files.Count) files, $([math]::Round((($files|Measure-Object Length -Sum).Sum)/1MB,1)) MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shoko.CLI_Standalone_${{ matrix.rid }}_${{ steps.ver.outputs.SHOKO_REF_RESOLVED }}
+          path: dist/**
+          retention-days: 30
+          if-no-files-found: error
