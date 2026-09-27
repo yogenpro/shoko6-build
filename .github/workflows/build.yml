@@ -88,6 +88,10 @@ jobs:
           "SHOKO_SHA=$sha"                         >> $env:GITHUB_OUTPUT
           "WEBUI_RESOLVED=$webui"                  >> $env:GITHUB_OUTPUT
           "SHOKO_REF=$ref"                         >> $env:GITHUB_ENV
+          # Must also go to GITHUB_ENV: later steps read $env:SHOKO_SHA to
+          # write the provenance file. A step output alone is not visible
+          # as an environment variable in subsequent steps.
+          "SHOKO_SHA=$sha"                         >> $env:GITHUB_ENV
           "WEBUI=$webui"                           >> $env:GITHUB_ENV
           "WEBUI_URL=https://github.com/ShokoAnime/Shoko-WebUI/releases/download/v$webui/Shoko-WebUI-v$webui.zip" >> $env:GITHUB_ENV
 
@@ -190,6 +194,7 @@ jobs:
           $webuiCount = if (Test-Path $webuiOut) { @(Get-ChildItem -Recurse -File $webuiOut).Count } else { 0 }
           "publish webui files = $webuiCount"
           if ($webuiCount -lt 20) { throw "webui did not reach publish output (only $webuiCount files)" }
+          if ([string]::IsNullOrWhiteSpace($env:SHOKO_SHA)) { throw "SHOKO_SHA is empty; provenance would be untraceable" }
           $files = @(Get-ChildItem -Recurse -File $out)
           $bytes = ($files | Measure-Object Length -Sum).Sum
           "publish files = $($files.Count)"
@@ -203,7 +208,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $out = "src\Shoko.Server\bin\Release\net10.0\${{ matrix.rid }}\publish"
-          $stage = "dist\Shoko.CLI_Standalone_${{ matrix.rid }}_$env:SHOKO_REF"
+          # Name the staged dir without repeating the artifact name, otherwise
+          # `gh run download` yields a doubly-nested directory.
+          $stage = "dist\shoko-$env:SHOKO_REF-${{ matrix.rid }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Recurse -Force (Join-Path $out '*') $stage
           # Record provenance INSIDE the artifact so a downloaded zip is
